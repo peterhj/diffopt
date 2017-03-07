@@ -1,0 +1,12 @@
+[package]
+name = "diffopt"
+version = "0.0.1"
+authors = ["Peter Jin <peterhaijin@gmail.com>"]
+
+[lib]
+name = "diffopt"
+path = "src/lib.rs"
+
+[dependencies]
+arraydiff = { path = "../arraydiff" }
+densearray = "*"
