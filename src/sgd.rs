@@ -1,6 +1,7 @@
 use arraydiff::prelude::*;
 use densearray::prelude::*;
 
+use rand::chacha::{ChaChaRng};
 use std::cmp::{min};
 use std::rc::{Rc};
 
@@ -30,9 +31,9 @@ pub struct Sgd {
   grads:                VarSet,
   obj:      Rc<AutodiffSink>,
   iter_nr:  usize,
-  param:        Array1d<f32>,
-  param_prev:   Array1d<f32>,
-  grad:         Array1d<f32>,
+  param:        Vec<f32>,
+  grad:         Vec<f32>,
+  prev_param:   Array1d<f32>,
   step:         Array1d<f32>,
 }
 
@@ -42,12 +43,21 @@ impl Sgd {
     let consts = const_vars.filter(|v| v.kind == Val);
     let params = param_vars.filter(|v| v.kind == Val);
     let grads = param_vars.filter(|v| v.kind == Grad);
-    let consts_params = consts.union(params.clone());
+    let consts_params = consts.clone().union(params.clone());
     let consts_params_grads = consts.union(params.clone()).union(grads.clone());
     /*let param_dim = obj.serial_size(new_txn, &mut params);
     let grad_dim = obj.serial_size(new_txn, &mut grads);
     assert_eq!(param_dim, grad_dim);*/
     unimplemented!();
+  }
+
+  pub fn reset(&mut self, rng: &mut ChaChaRng) {
+    let init_txn = txn();
+    // FIXME
+    //self.obj.init(init_txn, rng);
+    self.obj.store_val(init_txn, &mut self.params, 0, &mut self.param);
+    self.prev_param.as_view_mut().copy(self.param.flatten());
+    self.iter_nr = 0;
   }
 
   pub fn step<BatchFn>(&mut self, batch_fn: BatchFn) where BatchFn: Fn(TxnId, usize, Rc<AutodiffSink>) {
@@ -66,21 +76,20 @@ impl Sgd {
 
     // Store the gradient.
     let store_txn = txn();
-    self.obj.store_val(store_txn, &mut self.params, 0, self.param.as_mut_slice());
-    self.obj.store_grad(store_txn, &mut self.grads, 0, self.grad.as_mut_slice());
+    self.obj.store_grad(store_txn, &mut self.grads, 0, &mut self.grad);
 
     // Calculate the update.
     let step_size = self.cfg.step_size.at_iter(self.iter_nr) / self.cfg.minibatch_sz as f64;
-    self.step.as_view_mut().copy(self.param.as_view());
-    self.step.as_view_mut().add(-1.0, self.param_prev.as_view());
+    self.step.as_view_mut().copy(self.param.flatten());
+    self.step.as_view_mut().add(-1.0, self.prev_param.as_view());
     self.step.as_view_mut().scale(self.cfg.momentum as _);
-    self.step.as_view_mut().add(-step_size as _, self.grad.as_view());
-    self.param_prev.as_view_mut().copy(self.param.as_view());
-    self.param.as_view_mut().add(1.0, self.step.as_view());
+    self.step.as_view_mut().add(-step_size as _, self.grad.flatten());
+    self.prev_param.as_view_mut().copy(self.param.flatten());
+    self.param.flatten_mut().add(1.0, self.step.as_view());
 
     // Apply the update.
     let load_txn = txn();
-    self.obj.load_val(load_txn, &mut self.params, 0, self.param.as_mut_slice());
+    self.obj.load_val(load_txn, &mut self.params, 0, &mut self.param);
 
     // TODO: Optionally, update the batch norm running statistics.
 

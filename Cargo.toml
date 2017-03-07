@@ -8,5 +8,6 @@ name = "diffopt"
 path = "src/lib.rs"
 
 [dependencies]
+rand = "*"
 arraydiff = { path = "../arraydiff" }
 densearray = "*"
