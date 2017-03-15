@@ -101,18 +101,21 @@ impl Sgd {
     }
   }
 
-  pub fn step<BatchFn>(&mut self, batch_fn: BatchFn) where BatchFn: Fn(TxnId, usize, Rc<AutodiffSink>) {
+  pub fn step<BatchFn>(&mut self, mut batch_fn: BatchFn) where BatchFn: FnMut(TxnId, usize, usize, Rc<AutodiffSink>) {
     // Calculate the gradient.
     let num_batches = (self.cfg.minibatch_sz + self.cfg.batch_sz - 1) / self.cfg.batch_sz;
+    let mut batch_offset = 0;
     for batch_nr in 0 .. num_batches {
       let batch_txn = txn();
-      match batch_nr {
+      // TODO: give `batch_fn` the responsibility of persistence.
+      /*match batch_nr {
         0 => self.obj.persist(batch_txn, &mut self.consts_params),
         _ => self.obj.persist(batch_txn, &mut self.consts_params_grads),
-      }
+      }*/
       let batch_size = min(self.cfg.batch_sz, self.cfg.minibatch_sz - batch_nr * self.cfg.batch_sz);
-      batch_fn(batch_txn, batch_size, self.obj.clone());
+      batch_fn(batch_txn, batch_offset, batch_size, self.obj.clone());
       self.obj.gradient(batch_txn);
+      batch_offset += batch_size;
     }
 
     // Store the gradient.
