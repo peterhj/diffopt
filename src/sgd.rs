@@ -44,13 +44,12 @@ pub struct SgdConfig {
   pub batch_sz:         usize,
   pub minibatch_sz:     usize,
   pub step_size:        Box<Schedule>,
-  pub momentum:         f64,
+  pub momentum:         Option<f64>,
 }
 
 pub struct Sgd {
   cfg:          SgdConfig,
-  consts_params:        VarSet,
-  consts_params_grads:  VarSet,
+  params_grads: VarSet,
   params:       VarSet,
   grads:        VarSet,
   obj:          Rc<AutodiffSink>,
@@ -62,17 +61,15 @@ pub struct Sgd {
 }
 
 impl Sgd {
-  pub fn new(cfg: SgdConfig, obj: Rc<AutodiffSink>, param_vars: VarSet, const_vars: VarSet) -> Self {
+  pub fn new(cfg: SgdConfig, obj: Rc<AutodiffSink>, param_vars: VarSet) -> Self {
     let mut params = param_vars.filter(|v| v.kind == Val);
     let grads = param_vars.filter(|v| v.kind == Grad);
-    let consts = const_vars.filter(|v| v.kind == Val);
-    let mut consts_params = consts.clone().union(params.clone());
-    let consts_params_grads = consts.union(params.clone()).union(grads.clone());
+    let params_grads = params.clone().union(grads.clone());
 
     let new_txn = txn();
 
     // The function is assumed to be already initialized.
-    obj.persist(new_txn, &mut consts_params);
+    obj.persist(new_txn, &mut params);
     let dim = obj.val_size(new_txn, &mut params);
     assert!(dim > 0);
 
@@ -88,8 +85,7 @@ impl Sgd {
 
     Sgd{
       cfg:          cfg,
-      consts_params:        consts_params,
-      consts_params_grads:  consts_params_grads,
+      params_grads: params_grads,
       params:       params,
       grads:        grads,
       obj:          obj,
@@ -107,11 +103,6 @@ impl Sgd {
     let mut batch_offset = 0;
     for batch_nr in 0 .. num_batches {
       let batch_txn = txn();
-      // TODO: give `batch_fn` the responsibility of persistence.
-      /*match batch_nr {
-        0 => self.obj.persist(batch_txn, &mut self.consts_params),
-        _ => self.obj.persist(batch_txn, &mut self.consts_params_grads),
-      }*/
       let batch_size = min(self.cfg.batch_sz, self.cfg.minibatch_sz - batch_nr * self.cfg.batch_sz);
       batch_fn(batch_txn, batch_offset, batch_size, self.obj.clone());
       self.obj.gradient(batch_txn);
@@ -120,14 +111,17 @@ impl Sgd {
 
     // Store the gradient.
     let store_txn = txn();
-    self.obj.persist(store_txn, &mut self.grads);
+    self.obj.persist(store_txn, &mut self.params_grads);
+    self.obj.store_val(store_txn, &mut self.params, 0, &mut self.param);
     self.obj.store_grad(store_txn, &mut self.grads, 0, &mut self.grad);
 
     // Calculate the update.
-    let step_size = self.cfg.step_size.at_iter(self.iter_nr) / self.cfg.minibatch_sz as f64;
-    self.step.as_view_mut().copy(self.param.flatten());
-    self.step.as_view_mut().add(-1.0, self.prev_param.as_view());
-    self.step.as_view_mut().scale(self.cfg.momentum as _);
+    let step_size = self.cfg.step_size.at_iter(self.iter_nr) as f32;
+    if let Some(mu) = self.cfg.momentum {
+      self.step.as_view_mut().copy(self.param.flatten());
+      self.step.as_view_mut().add(-1.0, self.prev_param.as_view());
+      self.step.as_view_mut().scale(mu as _);
+    }
     self.step.as_view_mut().add(-step_size as _, self.grad.flatten());
     self.prev_param.as_view_mut().copy(self.param.flatten());
     self.param.flatten_mut().add(1.0, self.step.as_view());
