@@ -11,3 +11,4 @@ path = "src/lib.rs"
 rand = "*"
 arraydiff = { path = "../arraydiff" }
 densearray = "*"
+devicemem_cuda = { path = "../libdevicemem_cuda" }
