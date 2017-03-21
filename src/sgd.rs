@@ -6,6 +6,8 @@ use devicemem_cuda::comm::*;
 //use rand::chacha::{ChaChaRng};
 //use std::cell::{RefCell};
 use std::cmp::{min};
+use std::collections::hash_map::{DefaultHasher, RandomState};
+use std::hash::{BuildHasher, Hasher};
 use std::rc::{Rc};
 
 pub trait Schedule {
@@ -144,6 +146,7 @@ pub struct GPUSyncSgdBuilder {
   num_workers:  usize,
   //cfg:          SgdConfig,
   allreduce_builder:    GPURingAllreduceBuilder<f32>,
+  rand_state:   RandomState,
 }
 
 pub struct GPUSyncSgdWorker {
@@ -160,6 +163,9 @@ pub struct GPUSyncSgdWorker {
   grad_reducer: GPUAllreduceIo<f32>,
   prev_param:   DeviceArray1d<f32>,
   step:         DeviceArray1d<f32>,
+  param_h:      Vec<f32>,
+  grad_h:       Vec<f32>,
+  debug_hasher: DefaultHasher,
 }
 
 impl GPUSyncSgdBuilder {
@@ -168,6 +174,7 @@ impl GPUSyncSgdBuilder {
       num_workers:  num_workers,
       //cfg:          cfg,
       allreduce_builder:    GPURingAllreduceBuilder::new(num_workers),
+      rand_state:   RandomState::new(),
     }
   }
 
@@ -190,6 +197,16 @@ impl GPUSyncSgdBuilder {
     assert_eq!(dim, obj.store_val(init_txn, &mut params, 0, &mut param));
     prev_param.as_view_mut().copy(param.as_ref().flatten(), stream.conn());
 
+    let mut param_h = Vec::with_capacity(dim);
+    param_h.resize(dim, 0.0);
+    let mut grad_h = Vec::with_capacity(dim);
+    grad_h.resize(dim, 0.0);
+
+    let mut debug_hasher = self.rand_state.build_hasher();
+    param.as_ref().store_sync(&mut param_h, stream.conn());
+    debug_hasher.write(param_h.alias_bytes());
+    println!("DEBUG: worker: rank: {} init param hash: {}", worker_rank, debug_hasher.finish());
+
     GPUSyncSgdWorker{
       worker_rank:  worker_rank,
       num_workers:  self.num_workers,
@@ -204,6 +221,9 @@ impl GPUSyncSgdBuilder {
       grad_reducer: grad_reducer,
       prev_param:   prev_param,
       step:         step,
+      param_h:      param_h,
+      grad_h:       grad_h,
+      debug_hasher: debug_hasher,
     }
   }
 }
@@ -219,9 +239,9 @@ impl GPUSyncSgdWorker {
       let batch_txn = txn();
       let batch_size = min(self.cfg.batch_sz, local_minibatch_sz - batch_nr * self.cfg.batch_sz);
       batch_fn(batch_txn, batch_offset, batch_size, self.obj.clone());
-      if batch_nr == 0 {
+      /*if batch_nr == 0 {
         self.obj.store_val(batch_txn, &mut self.params, 0, &mut self.param);
-      }
+      }*/
       if batch_nr == num_local_batches - 1 {
         self.obj.store_grad(batch_txn, &mut self.grads, 0, &mut self.local_grad);
       }
@@ -243,6 +263,15 @@ impl GPUSyncSgdWorker {
     self.step.as_view_mut().add(-step_size, self.grad_reducer.as_ref().flatten(), self.stream.conn());
     self.prev_param.as_view_mut().copy(self.param.as_ref().flatten(), self.stream.conn());
     self.param.as_mut().flatten_mut().add(1.0, self.step.as_view(), self.stream.conn());
+
+    if (self.iter_nr + 1) % 100 == 0 {
+      self.grad_reducer.as_ref().store_sync(&mut self.grad_h, self.stream.conn());
+      self.param.as_ref().store_sync(&mut self.param_h, self.stream.conn());
+      self.debug_hasher.write(self.grad_h.alias_bytes());
+      println!("DEBUG: worker: rank: {} grad hash:  {}", self.worker_rank, self.debug_hasher.finish());
+      self.debug_hasher.write(self.param_h.alias_bytes());
+      println!("DEBUG: worker: rank: {} param hash: {}", self.worker_rank, self.debug_hasher.finish());
+    }
 
     // Apply the update.
     let load_txn = txn();
