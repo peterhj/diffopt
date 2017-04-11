@@ -9,14 +9,15 @@ use devicemem_cuda::comm::*;
 //use std::cell::{RefCell};
 use std::cmp::{min};
 use std::collections::hash_map::{DefaultHasher, RandomState};
+use std::fmt::{Debug};
 use std::hash::{BuildHasher, Hasher};
 use std::rc::{Rc};
 
-pub trait Schedule {
+pub trait Schedule: Debug {
   fn at_iter(&self, iter_nr: usize) -> f64;
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ConstantSchedule(pub f64);
 
 impl Schedule for ConstantSchedule {
@@ -25,7 +26,7 @@ impl Schedule for ConstantSchedule {
   }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct PiecewiseStepSchedule {
   pub init:     f64,
   pub pieces:   Vec<(usize, f64)>,
@@ -48,12 +49,19 @@ impl Schedule for PiecewiseStepSchedule {
   }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
+pub enum Momentum {
+  Polyak(f64),
+  Nesterov(f64),
+}
+
+#[derive(Clone, Debug)]
 pub struct SgdConfig {
   pub batch_sz:         usize,
   pub minibatch_sz:     usize,
   pub step_size:        Rc<Schedule>,
-  pub momentum:         Option<f64>,
+  pub momentum:         Option<Momentum>,
+  pub l2_reg:           Option<f64>,
   //pub l2_grad_clip:     Option<f64>,
 }
 
@@ -126,16 +134,24 @@ impl Sgd {
 
     // TODO: gradient clipping.
 
+    // Normalize the gradient by sample size.
     self.grad.flatten_mut().scale(1.0 / self.cfg.minibatch_sz as f32);
 
     // Calculate the update.
     let step_size = self.cfg.step_size.at_iter(self.iter_nr) as f32;
-    if let Some(mu) = self.cfg.momentum {
-      self.step.as_view_mut().copy(self.param.flatten());
-      self.step.as_view_mut().add(-1.0, self.prev_param.as_view());
-      self.step.as_view_mut().scale(mu as _);
-    } else {
-      self.step.as_view_mut().set_constant(0.0);
+    match self.cfg.momentum {
+      Some(Momentum::Polyak(mu)) => {
+        self.step.as_view_mut().copy(self.param.flatten());
+        self.step.as_view_mut().add(-1.0, self.prev_param.as_view());
+        self.step.as_view_mut().scale(mu as _);
+      }
+      Some(Momentum::Nesterov(_)) => {
+        // TODO
+        unimplemented!();
+      }
+      None => {
+        self.step.as_view_mut().set_constant(0.0);
+      }
     }
     self.step.as_view_mut().add(-step_size, self.grad.flatten());
     self.prev_param.as_view_mut().copy(self.param.flatten());
@@ -198,7 +214,7 @@ impl GPUSyncSgdBuilder {
     }
   }
 
-  pub fn into_worker(self, worker_rank: usize, cfg: SgdConfig, mut maybe_stats_ctrl: Option<&mut BatchStatsControl>, obj: Rc<AutodiffSink>, init_txn: TxnId, param_vars: &VarSet, stream: Rc<DeviceStream>) -> GPUSyncSgdWorker {
+  pub fn into_worker(self, worker_rank: usize, cfg: SgdConfig, /*mut maybe_stats_ctrl: Option<&mut BatchStatsControl>,*/ obj: Rc<AutodiffSink>, init_txn: TxnId, param_vars: &VarSet, stream: Rc<DeviceStream>) -> GPUSyncSgdWorker {
     let mut params = param_vars.filter(|v| v.kind == Val);
     let grads = param_vars.filter(|v| v.kind == Grad);
 
@@ -310,6 +326,10 @@ impl GPUSyncSgdWorker {
 
     self.local_buf.as_mut().unwrap().as_mut().slice_mut(0, self.dim).flatten_mut()
       .scale(1.0 / self.cfg.minibatch_sz as f32, self.stream.conn());
+    if let Some(lambda) = self.cfg.l2_reg {
+      self.local_buf.as_mut().unwrap().as_mut().slice_mut(0, self.dim).flatten_mut()
+        .add(lambda as _, self.param.as_ref().flatten(), self.stream.conn());
+    }
     if maybe_stats_ctrl.is_some() {
       self.local_buf.as_mut().unwrap().as_mut().slice_mut(self.dim, self.dim + self.stats_dim.unwrap()).flatten_mut()
         .scale(1.0 / self.num_workers as f32, self.stream.conn());
@@ -325,12 +345,21 @@ impl GPUSyncSgdWorker {
 
     // Calculate the update.
     let step_size = self.cfg.step_size.at_iter(self.iter_nr) as f32;
-    if let Some(mu) = self.cfg.momentum {
-      self.momentum.as_view_mut().scale(mu as _, self.stream.conn());
-      self.momentum.as_view_mut().add(-step_size, self.grad_reducer.as_ref().slice(0, self.dim).flatten(), self.stream.conn());
-      self.param.as_mut().flatten_mut().add(1.0, self.momentum.as_view(), self.stream.conn());
-    } else {
-      self.param.as_mut().flatten_mut().add(-step_size, self.grad_reducer.as_ref().slice(0, self.dim).flatten(), self.stream.conn());
+    match self.cfg.momentum {
+      None => {
+        self.param.as_mut().flatten_mut().add(-step_size, self.grad_reducer.as_ref().slice(0, self.dim).flatten(), self.stream.conn());
+      }
+      Some(Momentum::Polyak(mu)) => {
+        self.momentum.as_view_mut().scale(mu as _, self.stream.conn());
+        self.momentum.as_view_mut().add(-step_size, self.grad_reducer.as_ref().slice(0, self.dim).flatten(), self.stream.conn());
+        self.param.as_mut().flatten_mut().add(1.0, self.momentum.as_view(), self.stream.conn());
+      }
+      Some(Momentum::Nesterov(mu)) => {
+        self.param.as_mut().flatten_mut().add(-mu as _, self.momentum.as_view(), self.stream.conn());
+        self.momentum.as_view_mut().scale(mu as _, self.stream.conn());
+        self.momentum.as_view_mut().add(-step_size, self.grad_reducer.as_ref().slice(0, self.dim).flatten(), self.stream.conn());
+        self.param.as_mut().flatten_mut().add((1.0 + mu) as _, self.momentum.as_view(), self.stream.conn());
+      }
     }
 
     /*//if (self.iter_nr + 1) % 100 == 0 {
@@ -363,7 +392,11 @@ impl GPUSyncSgdWorker {
       }*/
     }*/
 
-    /*{
+    if (self.iter_nr + 1) % 50 == 0 {
+      self.param.as_ref().store_sync(&mut self.param_h, self.stream.conn());
+      self.debug_hasher.write(self.param_h.alias_bytes());
+      println!("DEBUG: worker: iter: {} rank: {} param hash: {:x}", self.iter_nr, self.worker_rank, self.debug_hasher.finish());
+
       self.grad_reducer.as_ref().slice(0, self.dim)
         .store_sync(&mut self.grad_h, self.stream.conn());
       self.debug_hasher.write(self.grad_h.alias_bytes());
@@ -373,7 +406,7 @@ impl GPUSyncSgdWorker {
         .store_sync(&mut self.stats_h, self.stream.conn());
       self.debug_hasher.write(self.stats_h.alias_bytes());
       println!("DEBUG: worker: iter: {} rank: {} stats hash: {:x}", self.iter_nr, self.worker_rank, self.debug_hasher.finish());
-    }*/
+    }
 
     // Apply the update.
     let load_txn = txn();
@@ -381,7 +414,6 @@ impl GPUSyncSgdWorker {
 
     // Optionally, update the batch norm running statistics.
     if let Some(ref mut stats_ctrl) = maybe_stats_ctrl {
-      // TODO
       self.stats.as_mut().unwrap().as_mut().flatten_mut()
         .average(0.01, self.grad_reducer.buffer().as_ref().slice(self.dim, self.dim + self.stats_dim.unwrap()).flatten(), self.stream.conn());
       stats_ctrl.load_fixed_stats(load_txn, 0, self.stats.as_mut().unwrap());

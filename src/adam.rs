@@ -8,17 +8,18 @@ use std::rc::{Rc};
 
 const EPSILON_32: f32 = 1.0e-10;
 
+#[derive(Clone, Debug)]
 pub struct AdamConfig {
   pub batch_sz:         usize,
   pub minibatch_sz:     usize,
-  pub step_size:        Box<Schedule>,
+  pub step_size:        Rc<Schedule>,
   pub gamma1:           f64,
   pub gamma2:           f64,
+  //pub l2_reg:           Option<f64>,
 }
 
 pub struct Adam {
   cfg:          AdamConfig,
-  params_grads: VarSet,
   params:       VarSet,
   grads:        VarSet,
   obj:          Rc<AutodiffSink>,
@@ -32,16 +33,12 @@ pub struct Adam {
 }
 
 impl Adam {
-  pub fn new(cfg: AdamConfig, obj: Rc<AutodiffSink>, param_vars: VarSet) -> Self {
+  pub fn new(cfg: AdamConfig, obj: Rc<AutodiffSink>, init_txn: TxnId, param_vars: &VarSet) -> Self {
     let mut params = param_vars.filter(|v| v.kind == Val);
     let grads = param_vars.filter(|v| v.kind == Grad);
-    let params_grads = params.clone().union(grads.clone());
-
-    let new_txn = txn();
 
     // The function is assumed to be already initialized.
-    obj.persist(new_txn, &mut params);
-    let dim = obj.val_size(new_txn, &mut params);
+    let dim = obj.val_size(init_txn, &mut params);
     assert!(dim > 0);
 
     let mut param = Vec::with_capacity(dim);
@@ -53,11 +50,10 @@ impl Adam {
     let tmp_buf = Array1d::zeros(dim);
     let direction = Array1d::zeros(dim);
 
-    assert_eq!(dim, obj.store_val(new_txn, &mut params, 0, &mut param));
+    assert_eq!(dim, obj.store_val(init_txn, &mut params, 0, &mut param));
 
     Adam{
       cfg:          cfg,
-      params_grads: params_grads,
       params:       params,
       grads:        grads,
       obj:          obj,
@@ -71,6 +67,10 @@ impl Adam {
     }
   }
 
+  pub fn iteration_count(&self) -> usize {
+    self.iter_nr
+  }
+
   pub fn step<BatchFn>(&mut self, mut batch_fn: BatchFn) where BatchFn: FnMut(TxnId, usize, usize, Rc<AutodiffSink>) {
     // Calculate the gradient.
     let num_batches = (self.cfg.minibatch_sz + self.cfg.batch_sz - 1) / self.cfg.batch_sz;
@@ -79,15 +79,17 @@ impl Adam {
       let batch_txn = txn();
       let batch_size = min(self.cfg.batch_sz, self.cfg.minibatch_sz - batch_nr * self.cfg.batch_sz);
       batch_fn(batch_txn, batch_offset, batch_size, self.obj.clone());
-      self.obj.gradient(batch_txn);
+      if batch_nr == 0 {
+        self.obj.store_val(batch_txn, &mut self.params, 0, &mut self.param);
+      }
+      if batch_nr == num_batches - 1 {
+        self.obj.store_grad(batch_txn, &mut self.grads, 0, &mut self.grad);
+      }
       batch_offset += batch_size;
     }
 
-    // Store the gradient.
-    let store_txn = txn();
-    self.obj.persist(store_txn, &mut self.params_grads);
-    self.obj.store_val(store_txn, &mut self.params, 0, &mut self.param);
-    self.obj.store_grad(store_txn, &mut self.grads, 0, &mut self.grad);
+    // Normalize the gradient by sample size.
+    self.grad.flatten_mut().scale(1.0 / self.cfg.minibatch_sz as f32);
 
     // Update the adaptive moments.
     self.grad_m1.as_view_mut().average(self.cfg.gamma1 as _, self.grad.flatten());
