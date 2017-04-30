@@ -1,3 +1,4 @@
+use super::*;
 use sgd::*;
 
 use arraydiff::prelude::*;
@@ -50,7 +51,7 @@ impl Adam {
     let tmp_buf = Array1d::zeros(dim);
     let direction = Array1d::zeros(dim);
 
-    assert_eq!(dim, obj.store_val(init_txn, &mut params, 0, &mut param));
+    //assert_eq!(dim, obj.store_val(init_txn, &mut params, 0, &mut param));
 
     Adam{
       cfg:          cfg,

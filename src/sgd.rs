@@ -1,3 +1,5 @@
+use super::*;
+
 use arraydiff::prelude::*;
 use arraydiff::ops::*;
 use densearray::prelude::*;
@@ -9,45 +11,8 @@ use devicemem_cuda::comm::*;
 //use std::cell::{RefCell};
 use std::cmp::{min};
 use std::collections::hash_map::{DefaultHasher, RandomState};
-use std::fmt::{Debug};
 use std::hash::{BuildHasher, Hasher};
 use std::rc::{Rc};
-
-pub trait Schedule: Debug {
-  fn at_iter(&self, iter_nr: usize) -> f64;
-}
-
-#[derive(Clone, Debug)]
-pub struct ConstantSchedule(pub f64);
-
-impl Schedule for ConstantSchedule {
-  fn at_iter(&self, _iter_nr: usize) -> f64 {
-    self.0
-  }
-}
-
-#[derive(Clone, Debug)]
-pub struct PiecewiseStepSchedule {
-  pub init:     f64,
-  pub pieces:   Vec<(usize, f64)>,
-}
-
-impl Schedule for PiecewiseStepSchedule {
-  fn at_iter(&self, iter_nr: usize) -> f64 {
-    if self.pieces.is_empty() {
-      return self.init;
-    }
-    for k in 0 .. self.pieces.len() {
-      if iter_nr < self.pieces[k].0 {
-        match k {
-          0 => return self.init,
-          _ => return self.pieces[k-1].1,
-        }
-      }
-    }
-    self.pieces[self.pieces.len()-1].1
-  }
-}
 
 #[derive(Clone, Debug)]
 pub enum Momentum {
@@ -392,20 +357,20 @@ impl GPUSyncSgdWorker {
       }*/
     }*/
 
-    if (self.iter_nr + 1) % 50 == 0 {
+    if (self.iter_nr + 1) % 500 == 0 {
       self.param.as_ref().store_sync(&mut self.param_h, self.stream.conn());
       self.debug_hasher.write(self.param_h.alias_bytes());
-      println!("DEBUG: worker: iter: {} rank: {} param hash: {:x}", self.iter_nr, self.worker_rank, self.debug_hasher.finish());
+      println!("DEBUG: worker: iter: {} rank: {} param hash: {:x}", self.iter_nr + 1, self.worker_rank, self.debug_hasher.finish());
 
       self.grad_reducer.as_ref().slice(0, self.dim)
         .store_sync(&mut self.grad_h, self.stream.conn());
       self.debug_hasher.write(self.grad_h.alias_bytes());
-      println!("DEBUG: worker: iter: {} rank: {} grad hash:  {:x}", self.iter_nr, self.worker_rank, self.debug_hasher.finish());
+      println!("DEBUG: worker: iter: {} rank: {} grad hash:  {:x}", self.iter_nr + 1, self.worker_rank, self.debug_hasher.finish());
 
       self.grad_reducer.as_ref().slice(self.dim, self.dim + self.stats_dim.unwrap())
         .store_sync(&mut self.stats_h, self.stream.conn());
       self.debug_hasher.write(self.stats_h.alias_bytes());
-      println!("DEBUG: worker: iter: {} rank: {} stats hash: {:x}", self.iter_nr, self.worker_rank, self.debug_hasher.finish());
+      println!("DEBUG: worker: iter: {} rank: {} stats hash: {:x}", self.iter_nr + 1, self.worker_rank, self.debug_hasher.finish());
     }
 
     // Apply the update.
