@@ -203,10 +203,8 @@ impl GPUAdam {
     self.direction.as_view_mut().copy(self.grad_m2.as_view(), self.stream.conn());
     self.direction.as_view_mut().scale(1.0 / (1.0 - (1.0 - self.cfg.gamma2 as f32).powi(self.iter_nr as i32 + 1)), self.stream.conn());
     self.direction.as_view_mut().add_constant(EPSILON_32, self.stream.conn());
-    // FIXME FIXME FIXME
-    unimplemented!();
-    //self.direction.as_view_mut().sqrt(self.stream.conn());
-    //self.direction.as_view_mut().elem_ldiv(self.grad_m1.as_view(), self.stream.conn());
+    self.direction.as_view_mut().sqrt(self.stream.conn());
+    self.direction.as_view_mut().elem_ldiv(self.grad_m1.as_view(), self.stream.conn());
     self.direction.as_view_mut().scale(1.0 / (1.0 - (1.0 - self.cfg.gamma1 as f32).powi(self.iter_nr as i32 + 1)), self.stream.conn());
     self.param.as_mut().flatten_mut().add(-step_size, self.direction.as_view(), self.stream.conn());
 
