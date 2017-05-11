@@ -8,16 +8,21 @@ use devicemem_cuda::prelude::*;
 use std::cmp::{min};
 use std::rc::{Rc};
 
-const EPSILON_32: f32 = 1.0e-10;
+/*const EPSILON_32: f32 = 1.0e-10;*/
+
+#[derive(Clone, Copy, Debug)]
+pub enum AdamVariant {
+  Adam{gamma1: f64, gamma2: f64, epsilon: f64},
+  RMSProp{momentum: f64, gamma: f64, epsilon: f64},
+}
 
 #[derive(Clone, Debug)]
 pub struct AdamConfig {
-  pub batch_sz:         usize,
-  pub minibatch_sz:     usize,
-  pub step_size:        Rc<Schedule>,
-  pub gamma1:           f64,
-  pub gamma2:           f64,
-  //pub l2_reg:           Option<f64>,
+  pub batch_sz:     usize,
+  pub minibatch_sz: usize,
+  pub step_size:    Rc<Schedule>,
+  //pub l2_reg:       Option<f64>,
+  pub variant:      AdamVariant,
 }
 
 pub struct Adam {
@@ -93,21 +98,29 @@ impl Adam {
     // Normalize the gradient by sample size.
     self.grad.flatten_mut().scale(1.0 / self.cfg.minibatch_sz as f32);
 
-    // Update the adaptive moments.
-    self.grad_m1.as_view_mut().average(self.cfg.gamma1 as _, self.grad.flatten());
-    self.tmp_buf.as_view_mut().copy(self.grad.flatten());
-    self.tmp_buf.as_view_mut().square();
-    self.grad_m2.as_view_mut().average(self.cfg.gamma2 as _, self.tmp_buf.as_view());
+    match self.cfg.variant {
+      AdamVariant::Adam{gamma1, gamma2, epsilon} => {
+        // Update the adaptive moments.
+        self.grad_m1.as_view_mut().average(gamma1 as _, self.grad.flatten());
+        self.tmp_buf.as_view_mut().copy(self.grad.flatten());
+        self.tmp_buf.as_view_mut().square();
+        self.grad_m2.as_view_mut().average(gamma2 as _, self.tmp_buf.as_view());
 
-    // Calculate the update.
-    let step_size = self.cfg.step_size.at_iter(self.iter_nr) as f32;
-    self.direction.as_view_mut().copy(self.grad_m2.as_view());
-    self.direction.as_view_mut().scale(1.0 / (1.0 - (1.0 - self.cfg.gamma2 as f32).powi(self.iter_nr as i32 + 1)));
-    self.direction.as_view_mut().add_scalar(EPSILON_32);
-    self.direction.as_view_mut().sqrt();
-    self.direction.as_view_mut().elem_ldiv(self.grad_m1.as_view());
-    self.direction.as_view_mut().scale(1.0 / (1.0 - (1.0 - self.cfg.gamma1 as f32).powi(self.iter_nr as i32 + 1)));
-    self.param.flatten_mut().add(-step_size, self.direction.as_view());
+        // Calculate the update.
+        let step_size = self.cfg.step_size.at_iter(self.iter_nr) as f32;
+        self.direction.as_view_mut().copy(self.grad_m2.as_view());
+        self.direction.as_view_mut().scale(1.0 / (1.0 - (1.0 - gamma2 as f32).powi(self.iter_nr as i32 + 1)));
+        self.direction.as_view_mut().add_scalar(epsilon as _);
+        self.direction.as_view_mut().sqrt();
+        self.direction.as_view_mut().elem_ldiv(self.grad_m1.as_view());
+        self.direction.as_view_mut().scale(1.0 / (1.0 - (1.0 - gamma1 as f32).powi(self.iter_nr as i32 + 1)));
+        self.param.flatten_mut().add(-step_size, self.direction.as_view());
+      }
+      AdamVariant::RMSProp{momentum, gamma, epsilon} => {
+        // TODO
+        unimplemented!();
+      }
+    }
 
     // Apply the update.
     let load_txn = txn();
@@ -192,21 +205,42 @@ impl GPUAdam {
     // Normalize the gradient by sample size.
     self.grad.as_mut().flatten_mut().scale(1.0 / self.cfg.minibatch_sz as f32, self.stream.conn());
 
-    // Update the adaptive moments.
-    self.grad_m1.as_view_mut().average(self.cfg.gamma1 as _, self.grad.as_ref().flatten(), self.stream.conn());
-    self.tmp_buf.as_view_mut().copy(self.grad.as_ref().flatten(), self.stream.conn());
-    self.tmp_buf.as_view_mut().square(self.stream.conn());
-    self.grad_m2.as_view_mut().average(self.cfg.gamma2 as _, self.tmp_buf.as_view(), self.stream.conn());
+    match self.cfg.variant {
+      AdamVariant::Adam{gamma1, gamma2, epsilon} => {
+        // Update the adaptive moments.
+        self.grad_m1.as_view_mut().average(gamma1 as _, self.grad.as_ref().flatten(), self.stream.conn());
+        self.tmp_buf.as_view_mut().copy(self.grad.as_ref().flatten(), self.stream.conn());
+        self.tmp_buf.as_view_mut().square(self.stream.conn());
+        self.grad_m2.as_view_mut().average(gamma2 as _, self.tmp_buf.as_view(), self.stream.conn());
 
-    // Calculate the update.
-    let step_size = self.cfg.step_size.at_iter(self.iter_nr) as f32;
-    self.direction.as_view_mut().copy(self.grad_m2.as_view(), self.stream.conn());
-    self.direction.as_view_mut().scale(1.0 / (1.0 - (1.0 - self.cfg.gamma2 as f32).powi(self.iter_nr as i32 + 1)), self.stream.conn());
-    self.direction.as_view_mut().add_constant(EPSILON_32, self.stream.conn());
-    self.direction.as_view_mut().sqrt(self.stream.conn());
-    self.direction.as_view_mut().elem_ldiv(self.grad_m1.as_view(), self.stream.conn());
-    self.direction.as_view_mut().scale(1.0 / (1.0 - (1.0 - self.cfg.gamma1 as f32).powi(self.iter_nr as i32 + 1)), self.stream.conn());
-    self.param.as_mut().flatten_mut().add(-step_size, self.direction.as_view(), self.stream.conn());
+        // Calculate the update.
+        let step_size = self.cfg.step_size.at_iter(self.iter_nr) as f32;
+        self.direction.as_view_mut().copy(self.grad_m2.as_view(), self.stream.conn());
+        self.direction.as_view_mut().scale(1.0 / (1.0 - (1.0 - gamma2 as f32).powi(self.iter_nr as i32 + 1)), self.stream.conn());
+        self.direction.as_view_mut().add_constant(epsilon as _, self.stream.conn());
+        self.direction.as_view_mut().sqrt(self.stream.conn());
+        self.direction.as_view_mut().elem_ldiv(self.grad_m1.as_view(), self.stream.conn());
+        self.direction.as_view_mut().scale(1.0 / (1.0 - (1.0 - gamma1 as f32).powi(self.iter_nr as i32 + 1)), self.stream.conn());
+        self.param.as_mut().flatten_mut().add(-step_size, self.direction.as_view(), self.stream.conn());
+      }
+      AdamVariant::RMSProp{momentum, gamma, epsilon} => {
+        // Update the adaptive moments.
+        self.tmp_buf.as_view_mut().copy(self.grad.as_ref().flatten(), self.stream.conn());
+        self.tmp_buf.as_view_mut().square(self.stream.conn());
+        self.grad_m2.as_view_mut().average(gamma as _, self.tmp_buf.as_view(), self.stream.conn());
+
+        // Calculate the update.
+        let step_size = self.cfg.step_size.at_iter(self.iter_nr) as f32;
+        self.direction.as_view_mut().copy(self.grad_m2.as_view(), self.stream.conn());
+        self.direction.as_view_mut().scale(1.0 / (1.0 - (1.0 - gamma as f32).powi(self.iter_nr as i32 + 1)), self.stream.conn());
+        self.direction.as_view_mut().add_constant(epsilon as _, self.stream.conn());
+        self.direction.as_view_mut().sqrt(self.stream.conn());
+        self.direction.as_view_mut().elem_ldiv(self.grad.as_ref().flatten(), self.stream.conn());
+        self.grad_m1.as_view_mut().scale(momentum as _, self.stream.conn());
+        self.grad_m1.as_view_mut().add(-step_size, self.direction.as_view(), self.stream.conn());
+        self.param.as_mut().flatten_mut().add(1.0, self.grad_m1.as_view(), self.stream.conn());
+      }
+    }
 
     // Apply the update.
     let load_txn = txn();
