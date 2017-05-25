@@ -6,14 +6,23 @@ use densearray::prelude::*;
 use devicemem_cuda::prelude::*;
 
 use std::cmp::{min};
+use std::fs::{File, create_dir_all};
+use std::path::{PathBuf};
 use std::rc::{Rc};
 
 /*const EPSILON_32: f32 = 1.0e-10;*/
 
+pub struct AdamChkptConfig {
+  pub chkpt_dir:    PathBuf,
+  pub iter_nr:      PathBuf,
+  pub grad_m1:      PathBuf,
+  pub grad_m2:      PathBuf,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum AdamVariant {
   Adam{gamma1: f64, gamma2: f64, epsilon: f64},
-  RMSProp{momentum: f64, gamma: f64, epsilon: f64},
+  RMSProp{momentum: f64, gamma1: f64, gamma2: f64, epsilon: f64},
 }
 
 #[derive(Clone, Debug)]
@@ -22,6 +31,7 @@ pub struct AdamConfig {
   pub minibatch_sz: usize,
   pub step_size:    Rc<Schedule>,
   //pub l2_reg:       Option<f64>,
+  pub grad_l2_clip: Option<f64>,
   pub variant:      AdamVariant,
 }
 
@@ -116,7 +126,7 @@ impl Adam {
         self.direction.as_view_mut().scale(1.0 / (1.0 - (1.0 - gamma1 as f32).powi(self.iter_nr as i32 + 1)));
         self.param.flatten_mut().add(-step_size, self.direction.as_view());
       }
-      AdamVariant::RMSProp{momentum, gamma, epsilon} => {
+      AdamVariant::RMSProp{momentum, gamma1, gamma2, epsilon} => {
         // TODO
         unimplemented!();
       }
@@ -141,8 +151,10 @@ pub struct GPUAdam {
   stream:       Rc<DeviceStream>,
   param:        DeviceMem<f32>,
   grad:         DeviceMem<f32>,
+  //grad_norm:    DeviceMem<f32>,
   grad_m1:      DeviceArray1d<f32>,
   grad_m2:      DeviceArray1d<f32>,
+  momentum:     DeviceArray1d<f32>,
   tmp_buf:      DeviceArray1d<f32>,
   direction:    DeviceArray1d<f32>,
 }
@@ -160,6 +172,7 @@ impl GPUAdam {
     let grad = DeviceMem::zeros(dim, stream.conn());
     let grad_m1 = DeviceArray1d::zeros(dim, stream.conn());
     let grad_m2 = DeviceArray1d::zeros(dim, stream.conn());
+    let momentum = DeviceArray1d::zeros(dim, stream.conn());
     let tmp_buf = DeviceArray1d::zeros(dim, stream.conn());
     let direction = DeviceArray1d::zeros(dim, stream.conn());
 
@@ -176,6 +189,7 @@ impl GPUAdam {
       grad:         grad,
       grad_m1:      grad_m1,
       grad_m2:      grad_m2,
+      momentum:     momentum,
       tmp_buf:      tmp_buf,
       direction:    direction,
     }
@@ -183,6 +197,40 @@ impl GPUAdam {
 
   pub fn iteration_count(&self) -> usize {
     self.iter_nr
+  }
+
+  pub fn save_checkpoint(&mut self, cfg: AdamChkptConfig) {
+    // FIXME: create the directory if necessary.
+    create_dir_all(&cfg.chkpt_dir).ok();
+    // FIXME: save the iter nr to file.
+    let mut file = File::create(&cfg.iter_nr).unwrap();
+    // FIXME: save the 1st grad moment to file.
+    let mut file = File::create(&cfg.grad_m1).unwrap();
+    // FIXME: save the 2nd grad moment to file.
+    let mut file = File::create(&cfg.grad_m2).unwrap();
+    // FIXME
+    unimplemented!();
+  }
+
+  pub fn resume_checkpoint(&mut self, cfg: AdamChkptConfig) {
+    // FIXME: create the directory if necessary.
+    create_dir_all(&cfg.chkpt_dir).ok();
+    // FIXME: load the iter nr from file.
+    let mut file = File::open(&cfg.iter_nr).unwrap();
+    // FIXME: load the 1st grad moment from file.
+    let mut file = File::open(&cfg.grad_m1).unwrap();
+    // FIXME: load the 2nd grad moment from file.
+    let mut file = File::open(&cfg.grad_m2).unwrap();
+    // FIXME
+    unimplemented!();
+  }
+
+  pub fn set_batch_size(&mut self, new_batch_size: usize) {
+    self.cfg.batch_sz = new_batch_size;
+  }
+
+  pub fn set_minibatch_size(&mut self, new_minibatch_size: usize) {
+    self.cfg.minibatch_sz = new_minibatch_size;
   }
 
   pub fn step<BatchFn>(&mut self, mut batch_fn: BatchFn) where BatchFn: FnMut(TxnId, usize, usize, Rc<AutodiffSink>) {
@@ -205,6 +253,15 @@ impl GPUAdam {
     // Normalize the gradient by sample size.
     self.grad.as_mut().flatten_mut().scale(1.0 / self.cfg.minibatch_sz as f32, self.stream.conn());
 
+    // Gradient clipping.
+    if let Some(clip_norm) = self.cfg.grad_l2_clip {
+      assert!(clip_norm > 0.0);
+      let grad_norm = self.grad.as_ref().flatten().l2_norm(self.stream.conn());
+      if grad_norm.abs() > clip_norm as f32 {
+        self.grad.as_mut().flatten_mut().scale(clip_norm as f32 / grad_norm.abs(), self.stream.conn());
+      }
+    }
+
     match self.cfg.variant {
       AdamVariant::Adam{gamma1, gamma2, epsilon} => {
         // Update the adaptive moments.
@@ -223,22 +280,29 @@ impl GPUAdam {
         self.direction.as_view_mut().scale(1.0 / (1.0 - (1.0 - gamma1 as f32).powi(self.iter_nr as i32 + 1)), self.stream.conn());
         self.param.as_mut().flatten_mut().add(-step_size, self.direction.as_view(), self.stream.conn());
       }
-      AdamVariant::RMSProp{momentum, gamma, epsilon} => {
+      AdamVariant::RMSProp{momentum, gamma1, gamma2, epsilon} => {
         // Update the adaptive moments.
+        self.grad_m1.as_view_mut().average(gamma1 as _, self.grad.as_ref().flatten(), self.stream.conn());
         self.tmp_buf.as_view_mut().copy(self.grad.as_ref().flatten(), self.stream.conn());
         self.tmp_buf.as_view_mut().square(self.stream.conn());
-        self.grad_m2.as_view_mut().average(gamma as _, self.tmp_buf.as_view(), self.stream.conn());
+        self.grad_m2.as_view_mut().average(gamma2 as _, self.tmp_buf.as_view(), self.stream.conn());
 
         // Calculate the update.
         let step_size = self.cfg.step_size.at_iter(self.iter_nr) as f32;
+        self.tmp_buf.as_view_mut().copy(self.grad_m1.as_view(), self.stream.conn());
+        //self.tmp_buf.as_view_mut().scale(1.0 / (1.0 - (1.0 - gamma as f32).powi(self.iter_nr as i32 + 1)), self.stream.conn());
+        self.tmp_buf.as_view_mut().square(self.stream.conn());
         self.direction.as_view_mut().copy(self.grad_m2.as_view(), self.stream.conn());
-        self.direction.as_view_mut().scale(1.0 / (1.0 - (1.0 - gamma as f32).powi(self.iter_nr as i32 + 1)), self.stream.conn());
+        //self.direction.as_view_mut().scale(1.0 / (1.0 - (1.0 - gamma as f32).powi(self.iter_nr as i32 + 1)), self.stream.conn());
+        self.direction.as_view_mut().add(-1.0, self.tmp_buf.as_view(), self.stream.conn());
         self.direction.as_view_mut().add_constant(epsilon as _, self.stream.conn());
         self.direction.as_view_mut().sqrt(self.stream.conn());
-        self.direction.as_view_mut().elem_ldiv(self.grad.as_ref().flatten(), self.stream.conn());
-        self.grad_m1.as_view_mut().scale(momentum as _, self.stream.conn());
-        self.grad_m1.as_view_mut().add(-step_size, self.direction.as_view(), self.stream.conn());
-        self.param.as_mut().flatten_mut().add(1.0, self.grad_m1.as_view(), self.stream.conn());
+        /*self.direction.as_view_mut().elem_ldiv(self.grad.as_ref().flatten(), self.stream.conn());
+        self.momentum.as_view_mut().scale(momentum as _, self.stream.conn());
+        self.momentum.as_view_mut().add(-step_size, self.direction.as_view(), self.stream.conn());
+        self.param.as_mut().flatten_mut().add(1.0, self.momentum.as_view(), self.stream.conn());*/
+        self.direction.as_view_mut().elem_ldiv(self.grad_m1.as_view(), self.stream.conn());
+        self.param.as_mut().flatten_mut().add(1.0, self.direction.as_view(), self.stream.conn());
       }
     }
 
